@@ -402,12 +402,13 @@ if triton is not None and torch.cuda.is_available():
     triton.Config({'BLOCK_C':64,'BLOCK_W':128,'BLOCK_D':8}, num_warps=8, num_stages=2),
     triton.Config({'BLOCK_C':128,'BLOCK_W':64,'BLOCK_D':8}, num_warps=8, num_stages=2),
     triton.Config({'BLOCK_C':128,'BLOCK_W':128,'BLOCK_D':8}, num_warps=8, num_stages=2),
-  ], key=['C','W','D','G','K'])
+  ], key=['C','W','D','G','K','NORMALIZE'])
   @triton.jit
   def _gwc_triton_kernel(ref_ptr, tar_ptr, ref_norm_ptr, tar_norm_ptr, out_ptr, BH, C, W, D: tl.constexpr, G: tl.constexpr, K: tl.constexpr,
                          stride_rn, stride_rw, stride_rc, stride_tn, stride_tw, stride_tc,
                          stride_nn, stride_ng, stride_nw,
                          stride_on, stride_og, stride_od, stride_ow,
+                         NORMALIZE: tl.constexpr,
                          BLOCK_C: tl.constexpr, BLOCK_W: tl.constexpr, BLOCK_D: tl.constexpr):
     pid0 = tl.program_id(0)
     db = tl.program_id(1)
@@ -430,34 +431,38 @@ if triton is not None and torch.cuda.is_available():
       tar_vals = tl.load(tar_ptrs, mask=k_mask[:, None, None] & td_mask[None, :, :], other=0.).to(tl.float32)
       acc += tl.sum(tar_vals * ref_vals[:, None, :], axis=0)
 
-    norm_offset = bh*stride_nn + g*stride_ng
-    ref_norm = tl.load(ref_norm_ptr + norm_offset + w_off*stride_nw, mask=w_mask, other=1.0).to(tl.float32)
-    tar_norm = tl.load(tar_norm_ptr + norm_offset + w_src*stride_nw, mask=td_mask, other=1.0).to(tl.float32)
-    denom = (ref_norm[None, :] * tar_norm) + 1e-5
-    acc = acc / denom
+    if NORMALIZE:
+      norm_offset = bh*stride_nn + g*stride_ng
+      ref_norm = tl.load(ref_norm_ptr + norm_offset + w_off*stride_nw, mask=w_mask, other=1.0).to(tl.float32)
+      tar_norm = tl.load(tar_norm_ptr + norm_offset + w_src*stride_nw, mask=td_mask, other=1.0).to(tl.float32)
+      denom = (ref_norm[None, :] * tar_norm) + 1e-5
+      acc = acc / denom
     out_ptrs = out_ptr + bh*stride_on + g*stride_og + d_off[:, None]*stride_od + w_off[None, :]*stride_ow
     tl.store(out_ptrs, acc, mask=w_mask[None, :])
 
 @torch.no_grad()
-def build_gwc_volume_triton(refimg_fea: torch.Tensor, targetimg_fea: torch.Tensor, maxdisp: int, num_groups: int):
+def build_gwc_volume_triton(refimg_fea: torch.Tensor, targetimg_fea: torch.Tensor, maxdisp: int, num_groups: int, normalize=True):
   if triton is None:
     raise RuntimeError('Triton is not available. Please install triton to use build_gwc_volume_triton.')
   B, C, H, W = refimg_fea.shape
   assert maxdisp > 0 and C % num_groups == 0
   K = C // num_groups
-  # Match dtype semantics of build_gwc_volume_optimized_pytorch1: keep computation/result in input dtype
   in_dtype = refimg_fea.dtype if refimg_fea.dtype in (torch.float16, torch.bfloat16, torch.float32) else torch.float32
 
-  ref_norm = refimg_fea.float().view(B, num_groups, K, H, W).norm(dim=2)
-  tar_norm = targetimg_fea.float().view(B, num_groups, K, H, W).norm(dim=2)
-  ref_norm = ref_norm.permute(0, 2, 1, 3).reshape(B*H, num_groups, W).to(in_dtype).contiguous()
-  tar_norm = tar_norm.permute(0, 2, 1, 3).reshape(B*H, num_groups, W).to(in_dtype).contiguous()
+  if normalize:
+    ref_norm = refimg_fea.float().view(B, num_groups, K, H, W).norm(dim=2)
+    tar_norm = targetimg_fea.float().view(B, num_groups, K, H, W).norm(dim=2)
+    ref_norm = ref_norm.permute(0, 2, 1, 3).reshape(B*H, num_groups, W).to(in_dtype).contiguous()
+    tar_norm = tar_norm.permute(0, 2, 1, 3).reshape(B*H, num_groups, W).to(in_dtype).contiguous()
+  else:
+    # Dummy tensors; kernel won't read them when NORMALIZE=False
+    ref_norm = refimg_fea.new_empty((1, 1, 1), dtype=in_dtype)
+    tar_norm = refimg_fea.new_empty((1, 1, 1), dtype=in_dtype)
 
   ref = refimg_fea.to(in_dtype)
   tar = targetimg_fea.to(in_dtype)
   ref_bhwc = ref.permute(0, 2, 3, 1).view(B * H, W, C).contiguous()
   tar_bhwc = tar.permute(0, 2, 3, 1).view(B * H, W, C).contiguous()
-  # Allocate output in the same dtype as inputs; disparities beyond W are zeros (same as left-pad+unfold)
   out_bhw = torch.empty((B * H, num_groups, maxdisp, W), device=ref.device, dtype=in_dtype)
   BH = B * H
   D_eff = min(maxdisp, W)
@@ -466,7 +471,8 @@ def build_gwc_volume_triton(refimg_fea: torch.Tensor, targetimg_fea: torch.Tenso
                            ref_bhwc.stride(0), ref_bhwc.stride(1), ref_bhwc.stride(2),
                            tar_bhwc.stride(0), tar_bhwc.stride(1), tar_bhwc.stride(2),
                            ref_norm.stride(0), ref_norm.stride(1), ref_norm.stride(2),
-                           out_bhw.stride(0), out_bhw.stride(1), out_bhw.stride(2), out_bhw.stride(3))
+                           out_bhw.stride(0), out_bhw.stride(1), out_bhw.stride(2), out_bhw.stride(3),
+                           NORMALIZE=normalize)
   if D_eff < maxdisp: out_bhw[:, :, D_eff:, :] = 0
   volume = out_bhw.view(B, H, num_groups, maxdisp, W).permute(0, 2, 3, 1, 4).contiguous()
   return volume
