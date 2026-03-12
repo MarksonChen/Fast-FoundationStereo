@@ -1,0 +1,27 @@
+[project]
+name = "fast-foundation-stereo"
+version = "0.1.0"
+description = "Fast-FoundationStereo: Real-Time Zero-Shot Stereo Matching"
+requires-python = ">=3.10"
+dependencies = [
+    "timm",
+    "einops",
+    "omegaconf",
+    "scipy",
+    "numpy",
+    "scikit-image",
+    "imageio",
+    "pyyaml",
+]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+# `core` must be a top-level package because torch.load (weights_only=False)
+# deserialises model classes stored as `core.foundation_stereo.*`.
+[tool.setuptools.packages.find]
+include = ["core*"]
+
+[tool.setuptools]
+py-modules = ["Utils"]
