@@ -12,6 +12,7 @@ dependencies = [
     "scikit-image",
     "imageio",
     "pyyaml",
+    "triton-windows; sys_platform == 'win32'",
 ]
 
 [build-system]
